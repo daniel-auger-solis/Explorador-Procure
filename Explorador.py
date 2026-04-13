@@ -161,69 +161,93 @@ NOTES = NotesStore()
 # ═══════════════════════════════════════════════════════════════════════════════
 class DarkScrollbar(tk.Canvas):
     """A themed scrollbar that actually respects colors on Windows."""
+    PAD = 2
+    MIN_THUMB = 20
+
     def __init__(self, master, orient="vertical", command=None, **kw):
-        self._orient  = orient
-        self._command = command
+        self._orient      = orient
+        self._command     = command
         self._thumb_start = 0.0
         self._thumb_end   = 1.0
-        self._drag_start  = None
+        self._dragging    = False
+        self._drag_offset = 0.0   # cursor offset within thumb at press time
 
         if orient == "vertical":
-            kw.setdefault("width", 20)
-            kw.setdefault("height", 40)
+            kw.setdefault("width", 12)
         else:
-            kw.setdefault("height", 20)
-            kw.setdefault("width", 40)
+            kw.setdefault("height", 12)
 
-        super().__init__(master, bg=BORDER, highlightthickness=0,
-                         bd=0, **kw)
-        self._thumb = self.create_rectangle(0,0,0,0,
-                                             fill=TEXT_DIM, outline="",
-                                             tags="thumb")
+        super().__init__(master, bg="#1a1a20", highlightthickness=0, bd=0, **kw)
+        self.create_rectangle(0,0,0,0, fill="#444450", outline="", tags="thumb")
         self.bind("<Configure>",      self._redraw)
         self.bind("<ButtonPress-1>",  self._on_press)
         self.bind("<B1-Motion>",      self._on_drag)
         self.bind("<ButtonRelease-1>",self._on_release)
-        self.tag_bind("thumb","<Enter>",
-                      lambda e: self.itemconfig("thumb", fill=TEXT))
-        self.tag_bind("thumb","<Leave>",
-                      lambda e: self.itemconfig("thumb", fill=TEXT_DIM))
+        self.tag_bind("thumb","<Enter>",  lambda e: self.itemconfig("thumb", fill="#6a6a80"))
+        self.tag_bind("thumb","<Leave>",  lambda e: self.itemconfig("thumb", fill="#444450"))
 
+    # ── public API (matches tk.Scrollbar) ──
     def set(self, lo, hi):
         self._thumb_start = float(lo)
         self._thumb_end   = float(hi)
         self._redraw()
 
-    def _redraw(self, e=None):
-        w = self.winfo_width()  or int(self.cget("width"))
-        h = self.winfo_height() or int(self.cget("height"))
-        pad = 2
+    # ── internal ──
+    def _track_size(self):
         if self._orient == "vertical":
-            y0 = pad + self._thumb_start * (h - 2*pad)
-            y1 = pad + self._thumb_end   * (h - 2*pad)
-            self.coords("thumb", pad, y0, w-pad, max(y1, y0+16))
+            return max(1, self.winfo_height() - 2*self.PAD)
+        return max(1, self.winfo_width() - 2*self.PAD)
+
+    def _thumb_pixels(self):
+        """Return (thumb_start_px, thumb_end_px) in canvas coords."""
+        ts = self._track_size()
+        t0 = self.PAD + self._thumb_start * ts
+        t1 = self.PAD + self._thumb_end   * ts
+        # enforce minimum size
+        if t1 - t0 < self.MIN_THUMB:
+            t1 = t0 + self.MIN_THUMB
+        return t0, t1
+
+    def _redraw(self, e=None):
+        w = self.winfo_width()  or int(self.cget("width")  if self._orient=="horizontal" else 12)
+        h = self.winfo_height() or int(self.cget("height") if self._orient=="vertical"   else 12)
+        t0, t1 = self._thumb_pixels()
+        if self._orient == "vertical":
+            self.coords("thumb", self.PAD, t0, w - self.PAD, t1)
         else:
-            x0 = pad + self._thumb_start * (w - 2*pad)
-            x1 = pad + self._thumb_end   * (w - 2*pad)
-            self.coords("thumb", x0, pad, max(x1, x0+16), h-pad)
+            self.coords("thumb", t0, self.PAD, t1, h - self.PAD)
+
+    def _pos_to_fraction(self, pos):
+        """Convert pixel position to 0..1 fraction along the track."""
+        return (pos - self.PAD) / self._track_size()
 
     def _on_press(self, e):
-        self._drag_start = (e.y if self._orient=="vertical" else e.x)
+        pos = e.y if self._orient == "vertical" else e.x
+        t0, t1 = self._thumb_pixels()
+        if t0 <= pos <= t1:
+            # click inside thumb — start drag, record offset from thumb start
+            self._dragging    = True
+            self._drag_offset = pos - t0
+        else:
+            # click outside thumb — jump: centre thumb on click position
+            self._dragging = False
+            if self._command:
+                size   = self._thumb_end - self._thumb_start
+                new_lo = max(0.0, min(1.0 - size,
+                             self._pos_to_fraction(pos) - size / 2))
+                self._command("moveto", new_lo)
 
     def _on_drag(self, e):
-        if self._drag_start is None or self._command is None: return
-        w = self.winfo_width();  h = self.winfo_height()
-        if self._orient == "vertical":
-            delta = (e.y - self._drag_start) / (h or 1)
-        else:
-            delta = (e.x - self._drag_start) / (w or 1)
-        self._drag_start = (e.y if self._orient=="vertical" else e.x)
-        size = self._thumb_end - self._thumb_start
-        new_lo = max(0.0, min(1.0 - size, self._thumb_start + delta))
+        if not self._dragging or not self._command: return
+        pos    = e.y if self._orient == "vertical" else e.x
+        size   = self._thumb_end - self._thumb_start
+        # desired start of thumb in fraction coords
+        new_lo = max(0.0, min(1.0 - size,
+                     self._pos_to_fraction(pos - self._drag_offset)))
         self._command("moveto", new_lo)
 
     def _on_release(self, e):
-        self._drag_start = None
+        self._dragging = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FILE BROWSER OVERLAY  (table layout)
@@ -1265,17 +1289,42 @@ class TabBar(tk.Frame):
         e.place(in_=lbl, x=0, y=0, relwidth=1, relheight=1)
         e.focus_set(); e.select_range(0,"end")
         self._edit_entry = e
+        self._rename_committed = False
 
         def commit(ev=None):
+            if self._rename_committed: return
+            self._rename_committed = True
             new_name = var.get().strip() or tab["name"]
             self._edit_entry = None
+            # unbind global click before destroying
+            try: self.winfo_toplevel().unbind("<Button-1>")
+            except: pass
             e.destroy()
             self.rename_tab(idx, new_name)
             self._on_rename(idx, new_name)
 
-        e.bind("<Return>",   commit)
-        e.bind("<FocusOut>", commit)
-        e.bind("<Escape>",   lambda ev: (e.destroy(), setattr(self,"_edit_entry",None)))
+        def cancel(ev=None):
+            if self._rename_committed: return
+            self._rename_committed = True
+            self._edit_entry = None
+            try: self.winfo_toplevel().unbind("<Button-1>")
+            except: pass
+            e.destroy()
+
+        def on_global_click(ev):
+            # commit if click is outside the entry widget
+            try:
+                ex = e.winfo_rootx(); ey = e.winfo_rooty()
+                ew = e.winfo_width();  eh = e.winfo_height()
+                if not (ex <= ev.x_root <= ex+ew and ey <= ev.y_root <= ey+eh):
+                    commit()
+            except tk.TclError:
+                pass
+
+        e.bind("<Return>", commit)
+        e.bind("<Escape>", lambda ev: cancel())
+        # bind global click on root to detect outside clicks
+        self.winfo_toplevel().bind("<Button-1>", on_global_click, add="+")
 
     @property
     def active(self): return self._active
@@ -1290,14 +1339,7 @@ class FolderBoard(tk.Tk):
         self.title("FolderBoard"); self.configure(bg=BG)
         self.geometry("1200x740"); self.minsize(700,480)
         # Remove native title bar — use custom one
-        # Remove native title decorations but keep taskbar entry
-        # On Windows: use overrideredirect but iconify via a trick
-        self.overrideredirect(True)
-        self._drag_x = self._drag_y = 0
-        self._maximized = False
-        self._restore_geo = "1200x740"
-        # Register as a normal window so it appears in taskbar (Windows trick)
-        self.after(10, self._register_taskbar)
+
         self.edit_mode = False
         self._browser  = None
         self._next_id  = 1
@@ -1321,45 +1363,6 @@ class FolderBoard(tk.Tk):
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        # ── custom title bar ──
-        tb = tk.Frame(self, bg="#0a0a0c", height=32)
-        tb.pack(fill="x", side="top"); tb.pack_propagate(False)
-
-        # drag to move
-        tb.bind("<ButtonPress-1>",   self._title_drag_start)
-        tb.bind("<B1-Motion>",        self._title_drag_move)
-        tb.bind("<Double-Button-1>",  self._title_toggle_max)
-
-        # app icon + name
-        tk.Label(tb, text="◈  FolderBoard", bg="#0a0a0c", fg=TEXT_DIM,
-                 font=("Segoe UI",9)).pack(side="left", padx=14)
-
-        # window controls — right side
-        wc = tk.Frame(tb, bg="#0a0a0c")
-        wc.pack(side="right")
-        self._btn_close = tk.Button(wc, text="  ✕  ", bg="#0a0a0c", fg=TEXT_DIM,
-                                     font=("Segoe UI",9), bd=0, pady=6,
-                                     cursor="hand2", relief="flat",
-                                     activebackground="#e81123",
-                                     activeforeground="#fff",
-                                     command=self.destroy)
-        self._btn_close.pack(side="right")
-        self._btn_max = tk.Button(wc, text="  ⬜  ", bg="#0a0a0c", fg=TEXT_DIM,
-                                   font=("Segoe UI",9), bd=0, pady=6,
-                                   cursor="hand2", relief="flat",
-                                   activebackground=BORDER,
-                                   activeforeground=TEXT,
-                                   command=self._title_toggle_max)
-        self._btn_max.pack(side="right")
-        tk.Button(wc, text="  ─  ", bg="#0a0a0c", fg=TEXT_DIM,
-                  font=("Segoe UI",9), bd=0, pady=6,
-                  cursor="hand2", relief="flat",
-                  activebackground=BORDER, activeforeground=TEXT,
-                  command=self._title_minimize).pack(side="right")
-
-        # resize border (1px) under title bar
-        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
-
         # ── app bar ──
         bar=tk.Frame(self,bg=SURFACE,height=44)
         bar.pack(fill="x",side="top"); bar.pack_propagate(False)
@@ -1400,57 +1403,6 @@ class FolderBoard(tk.Tk):
         return tk.Button(self._rc,text=text,bg=bg,fg=TEXT,
                          font=FONT_SMALL,bd=0,padx=11,pady=5,
                          cursor="hand2",command=cmd)
-
-    # ── custom title bar actions ───────────────────────────────────────────────
-    def _title_drag_start(self, e):
-        self._drag_x = e.x_root - self.winfo_x()
-        self._drag_y = e.y_root - self.winfo_y()
-
-    def _title_drag_move(self, e):
-        if self._maximized: return
-        x = e.x_root - self._drag_x
-        y = e.y_root - self._drag_y
-        self.geometry(f"+{x}+{y}")
-
-    def _register_taskbar(self):
-        """Make overrideredirect window appear in Windows taskbar."""
-        try:
-            import ctypes
-            # Get the hwnd and set the window as a tool window then back
-            # This forces Windows to add it to the taskbar
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
-            # Remove WS_EX_TOOLWINDOW (0x80), add WS_EX_APPWINDOW (0x40000)
-            style = (style & ~0x80) | 0x40000
-            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style)
-            self.withdraw(); self.deiconify()  # refresh
-        except Exception:
-            pass  # non-Windows, skip silently
-
-    def _title_minimize(self):
-        self.overrideredirect(False)
-        self.attributes("-alpha", 0)
-        self.iconify()
-        self.bind("<Map>", self._on_deiconify)
-
-    def _on_deiconify(self, e):
-        self.overrideredirect(True)
-        self.attributes("-alpha", 1)
-        self.unbind("<Map>")
-        self.after(50, self._register_taskbar)
-
-    def _title_toggle_max(self, e=None):
-        if self._maximized:
-            self._maximized = False
-            self.geometry(self._restore_geo)
-            self._btn_max.configure(text="  ⬜  ")
-        else:
-            self._restore_geo = self.geometry()
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-            self.geometry(f"{sw}x{sh}+0+0")
-            self._maximized = True
-            self._btn_max.configure(text="  ❐  ")
 
     def _draw_grid(self):
         self.canvas.delete("grid")
