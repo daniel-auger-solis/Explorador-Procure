@@ -990,11 +990,12 @@ class Tile:
     DEF_W, DEF_H = 150, 90
 
     def __init__(self, board, tid, name, path, color, x, y,
-                 w=None, h=None, saved_filters=None):
+                 w=None, h=None, saved_filters=None, tile_type="browser"):
         self.board = board
         self.tid   = tid
         self.name  = name
         self.path  = path
+        self.tile_type = tile_type  # "browser" | "folder" | "file"
         self.color = color
         self.x, self.y = x, y
         self.w = w or self.DEF_W
@@ -1025,9 +1026,11 @@ class Tile:
                                    outline=darken(self.color,20),width=1.5)
         bar  = c.create_rectangle(x,y,x+w,y+4,
                                    fill=darken(self.color,50),outline="")
-        # folder icon — fixed position relative to tile (top-left area)
+        # icon — type-dependent glyph, top-left
         icon_sz = max(10, min(22, h//4))
-        folder_icon = c.create_text(x+5, y, text="🗀",
+        tt = getattr(self, "tile_type", "browser")
+        glyph = {"browser":"🗀", "folder":"📁", "file":"📄"}.get(tt, "🗀")
+        folder_icon = c.create_text(x+5, y, text=glyph,
                                      font=("Segoe UI", icon_sz),
                                      fill=darken(fg,20), anchor="nw")
         fsz = max(9, min(16, w//10))
@@ -1105,12 +1108,22 @@ class Tile:
             for item in self._items: self.board.canvas.move(item,dx,dy)
 
     def _on_release(self,e):
-        if not self.board.edit_mode: self.board.open_browser(self)
+        if not self.board.edit_mode:
+            tt = getattr(self, "tile_type", "browser")
+            if tt == "folder":
+                if os.path.isdir(self.path): open_path(self.path)
+                else: messagebox.showerror("Error", "Carpeta no encontrada:\n"+self.path)
+            elif tt == "file":
+                if os.path.isfile(self.path): open_path(self.path)
+                else: messagebox.showerror("Error", "Archivo no encontrado:\n"+self.path)
+            else:
+                self.board.open_browser(self)
         else: self.board.save()
 
     def to_dict(self):
         return {"kind":"tile","tid":self.tid,"name":self.name,
                 "path":self.path,"color":self.color,
+                "tile_type": getattr(self,"tile_type","browser"),
                 "x":self.x,"y":self.y,"w":self.w,"h":self.h,
                 "saved_filters":self.saved_filters,
                 "active_chip":  getattr(self,"_active_chip",""),
@@ -1278,45 +1291,112 @@ class BaseDialog(tk.Toplevel):
 
 
 class TileDialog(BaseDialog):
-    def __init__(self,master,title="Nuevo acceso",tile=None):
-        super().__init__(master,title)
-        self._chosen_color=tile.color if tile else TILE_COLORS[0]
-        self._lbl(self,"Nombre",0)
-        self.ename=self._entry(self); self.ename.grid(row=0,column=1,padx=18,pady=5)
-        if tile: self.ename.insert(0,tile.name)
-        self._lbl(self,"Carpeta",1)
-        pf=tk.Frame(self,bg=SURFACE); pf.grid(row=1,column=1,padx=18,pady=5)
-        self.epath=self._entry(pf,22); self.epath.pack(side="left")
-        if tile: self.epath.insert(0,tile.path)
-        tk.Button(pf,text="…",bg=BORDER,fg=TEXT,font=FONT_SMALL,bd=0,
-                  padx=6,cursor="hand2",command=self._browse)\
-          .pack(side="left",padx=(4,0))
-        self._lbl(self,"Tamaño tile",2)
-        sf=tk.Frame(self,bg=SURFACE); sf.grid(row=2,column=1,padx=18,pady=5,sticky="w")
+    def __init__(self, master, title="Nuevo acceso", tile=None, tile_type="browser"):
+        super().__init__(master, title)
+        self._chosen_color = tile.color if tile else TILE_COLORS[0]
+        self._tile_type    = getattr(tile, "tile_type", tile_type) if tile else tile_type
+
+        row = 0
+        # type selector — only when creating new tile
+        if tile is None:
+            self._lbl(self, "Tipo", row)
+            tf = tk.Frame(self, bg=SURFACE)
+            tf.grid(row=row, column=1, padx=18, pady=6, sticky="w")
+            self._type_var = tk.StringVar(value=self._tile_type)
+            for val, lbl_text in [
+                ("browser", "🗀  Explorar directorio"),
+                ("folder",  "📁  Abrir carpeta"),
+                ("file",    "📄  Abrir archivo"),
+            ]:
+                tk.Radiobutton(tf, text=lbl_text, variable=self._type_var,
+                               value=val, bg=SURFACE, fg=TEXT,
+                               selectcolor=BORDER, activebackground=SURFACE,
+                               font=FONT_BODY, command=self._on_type_change)                  .pack(anchor="w", pady=1)
+            row += 1
+        else:
+            self._type_var = tk.StringVar(value=self._tile_type)
+
+        # name
+        self._lbl(self, "Nombre", row)
+        self.ename = self._entry(self)
+        self.ename.grid(row=row, column=1, padx=18, pady=5)
+        if tile: self.ename.insert(0, tile.name)
+        row += 1
+
+        # path
+        self._path_lbl_widget = tk.Label(self, text=self._path_label(),
+                                          bg=SURFACE, fg=TEXT_DIM, font=FONT_SMALL)
+        self._path_lbl_widget.grid(row=row, column=0, sticky="w", padx=18, pady=5)
+        pf = tk.Frame(self, bg=SURFACE)
+        pf.grid(row=row, column=1, padx=18, pady=5)
+        self.epath = self._entry(pf, 22)
+        self.epath.pack(side="left")
+        # auto-strip surrounding quotes on paste or focus-out
+        def _clean_path(e=None):
+            v = self.epath.get().strip()
+            if len(v) >= 2 and v[0] in ('"',"'") and v[-1] == v[0]:
+                self.epath.delete(0, "end")
+                self.epath.insert(0, v[1:-1].strip())
+        self.epath.bind("<FocusOut>",  _clean_path)
+        self.epath.bind("<<Paste>>",   lambda e: self.epath.after(10, _clean_path))
+        if tile: self.epath.insert(0, tile.path)
+        tk.Button(pf, text="…", bg=BORDER, fg=TEXT, font=FONT_SMALL, bd=0,
+                  padx=6, cursor="hand2", command=self._browse)          .pack(side="left", padx=(4,0))
+        row += 1
+
+        # size
+        self._lbl(self, "Tamaño tile", row)
+        sf = tk.Frame(self, bg=SURFACE)
+        sf.grid(row=row, column=1, padx=18, pady=5, sticky="w")
         tk.Label(sf,text="Ancho",bg=SURFACE,fg=TEXT_DIM,font=FONT_SMALL).pack(side="left")
-        self._wv=tk.IntVar(value=tile.w if tile else Tile.DEF_W)
+        self._wv = tk.IntVar(value=tile.w if tile else Tile.DEF_W)
         tk.Spinbox(sf,from_=80,to=400,textvariable=self._wv,width=5,
                    bg=BORDER,fg=TEXT,insertbackground=TEXT,
                    relief="flat",font=FONT_BODY).pack(side="left",padx=(4,10))
         tk.Label(sf,text="Alto",bg=SURFACE,fg=TEXT_DIM,font=FONT_SMALL).pack(side="left")
-        self._hv=tk.IntVar(value=tile.h if tile else Tile.DEF_H)
+        self._hv = tk.IntVar(value=tile.h if tile else Tile.DEF_H)
         tk.Spinbox(sf,from_=60,to=300,textvariable=self._hv,width=5,
                    bg=BORDER,fg=TEXT,insertbackground=TEXT,
                    relief="flat",font=FONT_BODY).pack(side="left",padx=(4,0))
-        self._color_row(self,3,self._chosen_color,TILE_COLORS)
-        self._btns(self,4,self._save)
+        row += 1
+
+        self._color_row(self, row, self._chosen_color, TILE_COLORS)
+        row += 1
+        self._btns(self, row, self._save)
         self.grab_set(); self.lift(); self._center()
 
+    def _path_label(self):
+        t = self._type_var.get() if hasattr(self, "_type_var") else self._tile_type
+        return "Archivo" if t == "file" else "Carpeta"
+
+    def _on_type_change(self):
+        self._tile_type = self._type_var.get()
+        self._path_lbl_widget.configure(text=self._path_label())
+
     def _browse(self):
-        d=filedialog.askdirectory()
-        if d: self.epath.delete(0,"end"); self.epath.insert(0,d)
+        t = self._type_var.get() if hasattr(self, "_type_var") else self._tile_type
+        if t == "file":
+            p = filedialog.askopenfilename(title="Seleccionar archivo")
+        else:
+            p = filedialog.askdirectory(title="Seleccionar carpeta")
+        if p:
+            self.epath.delete(0, "end")
+            self.epath.insert(0, p)
 
     def _save(self):
-        n=self.ename.get().strip(); p=self.epath.get().strip()
-        if not n: messagebox.showwarning("Falta nombre","Ingresa un nombre.",parent=self); return
-        if not p: messagebox.showwarning("Falta ruta","Selecciona una carpeta.",parent=self); return
-        self.result={"name":n,"path":p,"color":self._chosen_color,
-                     "w":self._wv.get(),"h":self._hv.get()}; self.destroy()
+        n = self.ename.get().strip()
+        # strip surrounding quotes (Windows copies paths with quotes sometimes)
+        p = self.epath.get().strip().strip('"').strip("'").strip()
+        t = self._type_var.get() if hasattr(self, "_type_var") else self._tile_type
+        if not n:
+            messagebox.showwarning("Falta nombre","Ingresa un nombre.",parent=self); return
+        if not p:
+            label = "archivo" if t == "file" else "carpeta"
+            messagebox.showwarning("Falta ruta",f"Selecciona un {label}.",parent=self); return
+        self.result = {"name":n,"path":p,"color":self._chosen_color,
+                       "w":self._wv.get(),"h":self._hv.get(),"tile_type":t}
+        self.destroy()
+
 
 
 class PanelDialog(BaseDialog):
@@ -1766,13 +1846,14 @@ class FolderBoard(tk.Tk):
     def _pos(self,col,ox=40,oy=60,sx=180,sy=130):
         n=len(col); return ox+(n%5)*sx, oy+(n//5)*sy
 
-    def add_tile(self,x=None,y=None):
+    def add_tile(self,x=None,y=None,tile_type="browser"):
         if not self._cur: return
-        dlg=TileDialog(self); self.wait_window(dlg)
+        dlg=TileDialog(self,tile_type=tile_type); self.wait_window(dlg)
         if not dlg.result: return
         tx,ty=(x,y) if x is not None else self._pos(self.tiles)
         t=Tile(self,self._nid(),dlg.result["name"],dlg.result["path"],
-               dlg.result["color"],tx,ty,dlg.result["w"],dlg.result["h"])
+               dlg.result["color"],tx,ty,dlg.result["w"],dlg.result["h"],
+               tile_type=dlg.result.get("tile_type","browser"))
         self._cur.tiles.append(t); self.save(); self.enforce_zorder()
 
     def add_panel(self,x=None,y=None):
@@ -1820,6 +1901,7 @@ class FolderBoard(tk.Tk):
         if not dlg.result: return
         t.name=dlg.result["name"]; t.path=dlg.result["path"]
         t.color=dlg.result["color"]; t.w=dlg.result["w"]; t.h=dlg.result["h"]
+        t.tile_type=dlg.result.get("tile_type", getattr(t,"tile_type","browser"))
         t.draw(); self.save(); self.enforce_zorder()
 
     def del_tile(self,t):
@@ -1923,7 +2005,8 @@ class FolderBoard(tk.Tk):
             if kind=="tile":
                 t=Tile(self,d["tid"],d["name"],d["path"],d["color"],
                        d["x"],d["y"],d.get("w",Tile.DEF_W),d.get("h",Tile.DEF_H),
-                       d.get("saved_filters",[]))
+                       d.get("saved_filters",[]),
+                       d.get("tile_type","browser"))
                 t._active_chip       = d.get("active_chip", t.saved_filters[0] if t.saved_filters else "")
                 t._browser_rev       = d.get("browser_rev", False)
                 t._browser_type      = d.get("browser_type", "all")
